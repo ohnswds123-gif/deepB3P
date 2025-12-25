@@ -8,6 +8,8 @@ import torch
 import torch.nn as nn
 import math
 import numpy as np
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
 def get_attn_pad_mask(seq_q, seq_k):
     """
@@ -90,7 +92,7 @@ class PoswiseFeedForwardNet(nn.Module):
         return nn.LayerNorm(self.d_model).to(self.device)(output + residual) # [bs, seq_len, d_model]
 
 class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, device, dropout=0.1, max_len=5000):
+    def __init__(self, d_model, device, dropout=0.1, max_len=30):
         super(PositionalEncoding, self).__init__()
         self.dropout = nn.Dropout(p=dropout)
 
@@ -126,24 +128,42 @@ class EncoderLayer(nn.Module):
         return enc_outputs, attn
 
 class Encoder(nn.Module):
-    def __init__(self, vocab_size, d_model, n_heads, d_k, d_v, d_ff, n_layers, drop, device):
+    def __init__(self, vocab_size, d_model, n_heads, d_k, d_v, d_ff, n_layers, drop, device, feat_dim):
         super(Encoder, self).__init__()
         self.src_emb = nn.Embedding(vocab_size, d_model)
         self.pos_emb = PositionalEncoding(d_model, device, drop)
         self.layers = nn.ModuleList([EncoderLayer(d_model, n_heads, d_k, d_v, d_ff, device) for _ in range(n_layers)])
 
-    def forward(self, enc_inputs):
+        if feat_dim and feat_dim > 0:
+            self.feat_proj = nn.Linear(feat_dim, d_model)
+
+    def forward(self, enc_inputs, extra_feats=None):
         """
         :param enc_inputs: [batch_size, seq_len]
+        :param extra_feats: [batch_size, seq_len, feat_dim] 额外特征
         :return: enc_outputs: [batch_size, seq_len, d_model], enc_self_attns: [batch_size, n_heads, seq_len, seq_len]
         """
-        enc_outputs = self.src_emb(enc_inputs) # [batch_size, seq_len, d_model]
-        enc_outputs = self.pos_emb(enc_outputs.transpose(0, 1)).transpose(0, 1) # [batch_size, seq_len, d_model]
-        enc_self_attn_mask = get_attn_pad_mask(enc_inputs, enc_inputs) # [batch_size, seq_len, seq_len]
+
+        # 编码器的输入通过嵌入层
+        enc_outputs = self.src_emb(enc_inputs)
+
+        # 如果存在额外的特征，通过 feat_proj 将它们投影到 d_model 并相加
+        if self.feat_proj is not None and extra_feats is not None:
+            enc_outputs = enc_outputs + self.feat_proj(extra_feats)  # 将额外特征添加到编码器输出
+        # 如果没有额外特征，保证 enc_outputs 仍然有值
+        if enc_outputs is None:
+            enc_outputs = self.src_emb(enc_inputs)  # 保证如果没有额外特征时，仍然有返回的 enc_outputs
+
+        # 加入位置编码
+        enc_outputs = self.pos_emb(enc_outputs.transpose(0, 1)).transpose(0, 1)  # [batch_size, seq_len, d_model]
+        # 生成 mask
+        enc_self_attn_mask = get_attn_pad_mask(enc_inputs, enc_inputs)  # [batch_size, seq_len, seq_len]
+        # 计算每一层的 self-attention
         enc_self_attns = []
         for layer in self.layers:
             enc_outputs, enc_self_attn = layer(enc_outputs, enc_self_attn_mask)
             enc_self_attns.append(enc_self_attn)
+
         return enc_outputs, enc_self_attns
 
 
@@ -168,7 +188,7 @@ class DecoderLayer(nn.Module):
 
 
 class Decoder(nn.Module):
-    def __init__(self, vocab_size, seq_len, d_model, n_heads, d_k, d_v, d_ff, n_layers, drop, device):
+    def __init__(self, vocab_size, seq_len, d_model, n_heads, d_k, d_v, d_ff, n_layers, drop, device, feat_dim):
         super(Decoder, self).__init__()
         self.seq_len = seq_len
         self.device = device
@@ -176,13 +196,21 @@ class Decoder(nn.Module):
         self.pos_emb = PositionalEncoding(d_model, device, drop)
         self.layers = nn.ModuleList([DecoderLayer(d_model, n_heads, d_k, d_v, d_ff, device) for _ in range(n_layers)])
 
-    def forward(self, dec_inputs, enc_outputs):
+        if feat_dim and feat_dim > 0:
+            self.feat_proj = nn.Linear(feat_dim, d_model)
+
+    def forward(self, dec_inputs, enc_outputs,extra_feats=None):
         """
         :param dec_inputs: [batch_size, seq_len]
         :param enc_outputs: [batch_size, seq_len, d_model]
         :return:
         """
         dec_outputs = self.tgt_emb(dec_inputs)
+        if self.feat_proj is not None and extra_feats is not None:
+            dec_outputs = dec_outputs + self.feat_proj(extra_feats)
+            if dec_outputs is None:
+                dec_outputs = self.src_emb(dec_inputs)
+
         dec_outputs = self.pos_emb(dec_outputs.transpose(0, 1)).transpose(0, 1).to(self.device)
         dec_self_attn_pad_mask = get_attn_pad_mask(dec_inputs, dec_inputs).to(self.device)
         dec_self_attns = []
@@ -192,3 +220,5 @@ class Decoder(nn.Module):
             dec_self_attns.append(dec_self_attn)
             dec_enc_attns.append(dec_enc_attn)
         return dec_outputs, dec_self_attns, dec_enc_attns
+
+
