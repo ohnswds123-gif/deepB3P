@@ -6,12 +6,24 @@
 
 import os
 import time
+import matplotlib.pyplot as plt
 from tqdm import tqdm
 from sklearn.model_selection import StratifiedKFold
 from torch.utils.data import SubsetRandomSampler
 
 from model.classifier_transformer2 import Classifier
 from utils.utils import *
+
+
+# def plot_loss_curve(loss_train, loss_val):
+#     # 绘制训练和验证损失曲线
+#     plt.plot(loss_train, label="Training Loss")
+#     plt.plot(loss_train, label="Validation Loss")
+#     plt.xlabel("Epochs")
+#     plt.ylabel("Loss")
+#     plt.legend()
+#     plt.title("Training vs Validation Loss")
+#     plt.show()
 
 class DeepB3P():
     def __init__(self, params, logger):
@@ -22,12 +34,16 @@ class DeepB3P():
         self.n_heads = params.n_heads
         self.d_k = params.d_k
         self.d_ff = params.d_ff
-        self.n_layers=params.n_layers
+        self.n_layers = params.n_layers
         self.device = params.device
         self.dropout = params.drop
         self.bs = params.bs
         self.epochs = params.n_epochs
         self.lr = params.lr
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        self.feat_dim = getattr(params, "feat_dim", 0)
+
         self.checkpoint = params.model_file
         self.l_mean = lambda l: sum(l) / len(l)
         self.logger = logger
@@ -47,9 +63,10 @@ class DeepB3P():
             d_ff=self.d_ff,
             n_layers=self.n_layers,
             drop=self.dropout,
-            device=self.device
+            device=self.device,
+            feat_dim = self.feat_dim          #
         ).to(self.device)
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr, betas=(0.9, 0.98), eps=1e-07)
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr, betas=(0.9, 0.98), eps=1e-07,weight_decay=1e-4)
         self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, mode='max')
         self.criterion = torch.nn.CrossEntropyLoss()
         self.logger.info(f'the model:\n{self.model}')
@@ -71,19 +88,33 @@ class DeepB3P():
         y_true_list, y_prob_list, loss_list = [], [], []
         train_start = time.time()
         for feats, labels in tqdm(data_loader, mininterval=1, desc='Training Processing', leave=False):
-            feats, labels = feats.to(self.device), labels.to(self.device)
+            if isinstance(feats, (list, tuple)):
+                x_ids, extra_feats = feats
+            else:
+                x_ids = feats
+                extra_feats = None
+
+            x_ids = x_ids.to(self.device)
+            if extra_feats is not None:
+                extra_feats = extra_feats.to(self.device)
+
+            labels = labels.to(self.device)
 
             optimizer.zero_grad()
-            outputs = self.model(feats)
+
+            # ✅ 只传 x_ids 和 extra_feats
+            outputs = self.model(x_ids, extra_feats)
+
             loss = self.criterion(outputs, labels)
             loss.backward()
             optimizer.step()
+
             y_train = labels.cpu().detach().numpy()
             y_prob = outputs[:, 1].cpu().detach().numpy()
-            loss_trian = loss.cpu().detach().numpy()
+            loss_train = loss.cpu().detach().numpy()
             y_true_list.extend(y_train)
             y_prob_list.extend(y_prob)
-            loss_list.append(loss_trian)
+            loss_list.append(loss_train)
         time_epoch = (time.time() - train_start) / 60
         y_pred_list = transfer(y_prob_list, 0.5)
         ys_train = (y_true_list, y_pred_list, y_prob_list)
@@ -95,25 +126,43 @@ class DeepB3P():
         y_true_list, y_prob_list, loss_list = [], [], []
         with torch.no_grad():
             self.model.eval()
+
             for feats, labels in tqdm(data_loader, mininterval=1, desc='Validing Processing', leave=False):
-                feats, labels = feats.to(self.device), labels.to(self.device)
-                outputs = self.model(feats)
+
+                if isinstance(feats, (list, tuple)):
+                    x_ids, extra_feats = feats
+                else:
+                    x_ids = feats
+                    extra_feats = None
+
+                x_ids = x_ids.to(self.device)
+                if extra_feats is not None:
+                    extra_feats = extra_feats.to(self.device)
+
+                labels = labels.to(self.device)
+
+                # 只传 x_ids 和 extra_feats
+                outputs = self.model(x_ids, extra_feats)
+
                 loss = self.criterion(outputs, labels)
                 y_train = labels.cpu().detach().numpy()
                 y_prob = outputs[:, 1].cpu().detach().numpy()
-                loss_trian = loss.cpu().detach().numpy()
+                loss_train = loss.cpu().detach().numpy()
                 y_true_list.extend(y_train)
                 y_prob_list.extend(y_prob)
-                loss_list.append(loss_trian)
+                loss_list.append(loss_train)
             time_epoch = (time.time() - train_start) / 60
             y_pred_list = transfer(y_prob_list, 0.5)
             ys_train = (y_true_list, y_pred_list, y_prob_list)
             metrics_train = cal_performance(y_true_list, y_pred_list, y_prob_list, self.logger, logging_=True)
+
             return ys_train, loss_list, metrics_train, time_epoch
 
-    def cv_train(self, dataset, kFlod=5, earlyStop=5, seed=2023):
+
+    def cv_train(self, dataset, kFlod=5, earlyStop=5, seed=2025):
         splits = StratifiedKFold(n_splits=kFlod, shuffle=True, random_state=seed+self.vocab_size)
         fold_best = []
+        losses_train, losses_valid = [], []
         for fold, (train_idx, val_idx) in enumerate(splits.split(dataset[:][0], dataset[:][1])):
             set_seed(fold + 1, self.logger)
             self.model.reset_parameters()
@@ -125,7 +174,7 @@ class DeepB3P():
             train_loader = DataLoader(dataset, batch_size=self.bs, sampler=train_sampler, drop_last=True)
             valid_loader = DataLoader(dataset, batch_size=self.bs, sampler=valid_sampler, drop_last=True)
 
-            optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr, betas=(0.9, 0.98), eps=1e-07)
+            optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr, betas=(0.9, 0.98), eps=1e-07,weight_decay=1e-4)
 
             best_record = {'train_loss': 0, 'test_loss': 0, 'train_acc': 0, 'test_acc': 0, 'train_f': 0,
                            'test_f': 0, 'train_pre': 0, 'test_pre': 0, 'train_rec': 0, 'test_rec': 0,
@@ -135,9 +184,11 @@ class DeepB3P():
                 # metrics --> auc, sn, sp, acc, mcc
                 ys_train, loss_train, metrics_train, time_epoch = self.train_epoch(train_loader, optimizer)
                 loss_train = np.mean(loss_train)
+                losses_train.append(loss_train)
                 self.logger.info(f'training: Epoch-{epoch}/{self.epochs} | loss={loss_train:.4f} | time={time_epoch:.4f} min')
                 ys_valid, loss_valid, metrics_valid, time_epoch = self.valid_epoch(valid_loader)
                 loss_valid = np.mean(loss_valid)
+                losses_valid.append(loss_valid)
                 self.logger.info(f'validing: Epoch-{epoch}/{self.epochs} | loss={loss_valid:.4f} | time={time_epoch:.4f} min')
 
                 if best_acc < metrics_valid[3]:
@@ -149,25 +200,39 @@ class DeepB3P():
                     best_record['valid_sp'] = metrics_valid[2]
                     best_record['valid_acc'] = metrics_valid[3]
                     best_record['valid_mcc'] = metrics_valid[4]
+
+                    # best_record['valid_pre'] = metrics_valid[5]
+                    # best_record['valid_f1']  = metrics_valid[6]
+                    # best_record['valid_auprc'] = metrics_valid[7]
+
                     best_record['train_loss'] = loss_train
                     best_record['train_auc'] = metrics_train[0]
                     best_record['train_sn'] = metrics_train[1]
                     best_record['train_sp'] = metrics_train[2]
                     best_record['train_acc'] = metrics_train[3]
                     best_record['train_mcc'] = metrics_train[4]
+
+                    # best_record['train_pre'] = metrics_train[5]
+                    # best_record['train_f1'] = metrics_train[6]
+                    # best_record['train_auprc'] = metrics_train[7]
+
                     self.logger.info('Get a better model with acc {0:.4f}'.format(best_acc))
                     self.save_model(kFlod=fold + 1)
                 else:
                     nobetter += 1
                     if nobetter >= earlyStop:
                         self.logger.info(f'validing acc has not improved for more '
-                                     f'than {earlyStop} steps in epoch {epoch}, stop training')
+                                         f'than {earlyStop} steps in epoch {epoch}, stop training')
                         break
             fold_best.append(best_record)
             self.logger.info(f'cv fold {kFlod} for fold {fold + 1} done')
+
+
+
             self.logger.info(f'Find best model, valid auc:{best_record["valid_auc"]:.3f},  '
-                         f'sn:{best_record["valid_sn"]:.3f},  sp:{best_record["valid_sp"]:.3f}, '
-                         f'acc:{best_record["valid_acc"]:.3f}, mcc:{best_record["valid_mcc"]:.3f}')
+                             f'sn:{best_record["valid_sn"]:.3f},  sp:{best_record["valid_sp"]:.3f}, '
+                             f'acc:{best_record["valid_acc"]:.3f}, mcc:{best_record["valid_mcc"]:.3f}')
+  # 每个fold结束后绘制损失曲线
         self.logger.info('all folds are done')
         row_first = ['Fold', 'auc', 'sn', 'sp', 'acc', 'mcc']
         self.logger.info(''.join(f'{item:<12}' for item in row_first))
