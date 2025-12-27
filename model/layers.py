@@ -43,7 +43,7 @@ class AttentionLayer(nn.Module):
         self.n_heads = n_heads
         self.dropout = nn.Dropout(dropout)
         self.att = nn.MultiheadAttention(embed_dim=embedding_size, num_heads=n_heads, batch_first=True, device=device)
-        self.layer_norm = nn.LayerNorm(normalized_shape=[50, embedding_size])
+        self.layer_norm = nn.LayerNorm(normalized_shape=[30, embedding_size])
 
     def forward(self, x, y=None):
         out, weight = self.att(x, x, x)
